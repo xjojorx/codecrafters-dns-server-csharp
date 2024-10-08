@@ -152,7 +152,13 @@ static byte[] EncodeQuestion(DNSQuestion question)
     .Aggregate((acc, curr) => acc.Concat(curr))
     .ToArray();
 
-  return nameBytes;
+  var typeBytes = new byte[2];
+  (typeBytes[0], typeBytes[1]) = SplitShort((short)question.RecordType);
+  var classBytes = new byte[2];
+  (classBytes[0], classBytes[1]) = SplitShort((short)question.Class);
+
+  byte[] res = [..nameBytes, 0, ..typeBytes, ..classBytes];
+  return res;
 }
 static byte[] EncodeLabel(string label) {
   byte[] labelBytes = Encoding.ASCII.GetBytes(label);
