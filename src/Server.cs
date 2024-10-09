@@ -25,15 +25,13 @@ while (true)
 /// logic
 ///////////////////////////////////////
 
-static byte[] HandleMessage(Span<byte> data, IPEndPoint sourceEndPoint)
+static byte[] HandleMessage(byte[] data, IPEndPoint sourceEndPoint)
 {
     string receivedString = Encoding.ASCII.GetString(data);
 
     Console.WriteLine($"Received {data.Length} bytes from {sourceEndPoint}: {receivedString}");
 
-    var reqHeader = ParseHeader(data.Slice(0, 12));
-
-    var req = new DNSRequest(reqHeader);
+    var req = ParseRequest(data);
 
     var res = BuildResponse(req);
 
@@ -46,12 +44,26 @@ static byte[] HandleMessage(Span<byte> data, IPEndPoint sourceEndPoint)
 ///////////////////////////////////////
 /// functions
 ///////////////////////////////////////
+static DNSRequest ParseRequest(byte[] data) {
+    var stream = new MemoryStream(data);
+
+    var hdrBytes = new byte[12];
+    _ = stream.Read(hdrBytes);
+    var reqHeader = ParseHeader(hdrBytes);
+
+    var question = ParseQuestion(stream);
+
+
+    var req = new DNSRequest(reqHeader, question);
+    return req;
+}
+
 static DNSResponse BuildResponse(DNSRequest request)
 {
     // Create an empty response
     var header = InitHeader(request);
-    var question = InitQuestion();
-    var answer = InitAnswer();
+    var question = InitQuestion(request);
+    var answer = InitAnswer(request);
 
     return new DNSResponse(header, question, answer);
 }
@@ -67,26 +79,21 @@ static DNSHeader InitHeader(DNSRequest request)
     return dNSHeader;
 }
 
-static short GeneratePacketId()
+static DNSQuestion InitQuestion(DNSRequest request)
 {
-    // int rnd = Random.Shared.Next();
-    // return (short)rnd;
-    return 1234;
-}
-
-static DNSQuestion InitQuestion()
-{
-    string name = "codecrafters.io";
-    var labels = name.Split('.').ToList();
+    // string name = "codecrafters.io";
+    // var labels = name.Split('.').ToList();
+    var labels = request.Question.Labels;
     var type = RecordTypes.A;
     var qclass = RecordClasses.IN;
     return new DNSQuestion(labels, type, qclass);
 }
 
-static DNSAnswer InitAnswer()
+static DNSAnswer InitAnswer(DNSRequest request)
 {
-    string name = "codecrafters.io";
-    var labels = name.Split('.').ToList();
+    // string name = "codecrafters.io";
+    // var labels = name.Split('.').ToList();
+    var labels = request.Question.Labels;
     var type = RecordTypes.A;
     var qclass = RecordClasses.IN;
     byte[] dataBytes = [0x08, 0x08, 0x08, 0x08];
@@ -168,7 +175,6 @@ static byte[] EncodeHeader(DNSHeader header)
 }
 static DNSHeader ParseHeader(Span<byte> data)
 {
-
     //first 2 bytes -> short id
     short id = JoinShort(data.Slice(0, 2));
 
@@ -221,6 +227,38 @@ static byte[] EncodeLabel(string label)
 {
     byte[] labelBytes = Encoding.ASCII.GetBytes(label);
     return [(byte)labelBytes.Length, .. labelBytes];
+}
+
+static DNSQuestion ParseQuestion(Stream stream) {
+    //read labels (read until 0x00;
+
+    List<String> labels = [];
+    bool labelsEnd = false;
+    var buf = new byte[128];
+    Span<byte> bufSpan = buf;
+    while(!labelsEnd) {
+        var len = stream.ReadByte();
+        if(len == 0x00) {
+            labelsEnd = true;
+        } else {
+            _ = stream.Read(buf, 0, len);
+            var labelBytes = bufSpan.Slice(0,len);
+            var label = Encoding.ASCII.GetString(labelBytes);
+            labels.Add(label);
+        }
+    }
+
+    var typeByte1 = stream.ReadByte();
+    var typeByte2 = stream.ReadByte();
+    var typeVal = (typeByte1 <<8) | typeByte2;
+    var type = (RecordTypes) typeVal;
+
+    var classByte1 = stream.ReadByte();
+    var classByte2 = stream.ReadByte();
+    var classVal = (classByte1 <<8) | classByte2;
+    var rclass = (RecordClasses) classVal;
+
+    return new DNSQuestion(labels, type, rclass);
 }
 
 static byte[] EncodeAnswer(DNSAnswer answer)
@@ -333,4 +371,4 @@ record DNSQuestion(List<string> Labels, RecordTypes RecordType, RecordClasses Cl
 record DNSAnswer(List<string> Labels, RecordTypes RecordType, RecordClasses Class, int TTL, short Length, byte[] Data);
 
 record DNSResponse(DNSHeader Header, DNSQuestion Question, DNSAnswer Answer);
-record DNSRequest(DNSHeader Header);
+record DNSRequest(DNSHeader Header, DNSQuestion Question);
