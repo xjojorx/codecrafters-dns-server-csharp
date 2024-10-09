@@ -25,14 +25,17 @@ while (true)
 /// logic
 ///////////////////////////////////////
 
-static byte[] HandleMessage(byte[] data, IPEndPoint sourceEndPoint)
+static byte[] HandleMessage(Span<byte> data, IPEndPoint sourceEndPoint)
 {
     string receivedString = Encoding.ASCII.GetString(data);
 
     Console.WriteLine($"Received {data.Length} bytes from {sourceEndPoint}: {receivedString}");
 
+    var reqHeader = ParseHeader(data.Slice(0, 12));
 
-    var res = BuildResponse();
+    var req = new DNSRequest(reqHeader);
+
+    var res = BuildResponse(req);
 
     var response = EncodeResponse(res);
 
@@ -43,20 +46,23 @@ static byte[] HandleMessage(byte[] data, IPEndPoint sourceEndPoint)
 ///////////////////////////////////////
 /// functions
 ///////////////////////////////////////
-static DNSResponse BuildResponse()
+static DNSResponse BuildResponse(DNSRequest request)
 {
     // Create an empty response
-    var header = InitHeader();
+    var header = InitHeader(request);
     var question = InitQuestion();
     var answer = InitAnswer();
 
     return new DNSResponse(header, question, answer);
 }
 
-static DNSHeader InitHeader()
+static DNSHeader InitHeader(DNSRequest request)
 {
-    var id = GeneratePacketId();
-    DNSHeader dNSHeader = new DNSHeader(id, QRId.Response, 0, false, false, false, false, Reserved.None, ResponseCodes.Ok, 1, 1, 0, 0);
+    ResponseCodes rc = request.Header.Opcode switch {
+        0 => ResponseCodes.Ok,
+        _ => ResponseCodes.NotImplemented
+    };
+    DNSHeader dNSHeader = new DNSHeader(request.Header.ID, QRId.Response, request.Header.Opcode, false, false, request.Header.RecursionDesired, false, Reserved.None, rc, 1, 1, 0, 0);
 
     return dNSHeader;
 }
@@ -79,15 +85,15 @@ static DNSQuestion InitQuestion()
 
 static DNSAnswer InitAnswer()
 {
-  string name = "codecrafters.io";
-  var labels = name.Split('.').ToList();
-  var type = RecordTypes.A;
-  var qclass = RecordClasses.IN;
-  byte[] dataBytes = [0x08,0x08,0x08,0x08];
-  short len = (short)dataBytes.Length;
-  int ttl = 60;
+    string name = "codecrafters.io";
+    var labels = name.Split('.').ToList();
+    var type = RecordTypes.A;
+    var qclass = RecordClasses.IN;
+    byte[] dataBytes = [0x08, 0x08, 0x08, 0x08];
+    short len = (short)dataBytes.Length;
+    int ttl = 60;
 
-  return new DNSAnswer(labels, type, qclass, ttl, len, dataBytes);
+    return new DNSAnswer(labels, type, qclass, ttl, len, dataBytes);
 }
 
 static byte[] EncodeResponse(DNSResponse response)
@@ -160,6 +166,40 @@ static byte[] EncodeHeader(DNSHeader header)
 
     return buf;
 }
+static DNSHeader ParseHeader(Span<byte> data)
+{
+
+    //first 2 bytes -> short id
+    short id = JoinShort(data.Slice(0, 2));
+
+    //byte 3
+    bool qrSet = (data[2] & (1 << 7)) != 0;
+    QRId qr = qrSet ? QRId.Query : QRId.Response;
+
+    int opcodeval = (data[2] >> 3) & 0x0f;
+    Opcodes opcode = (Opcodes)opcodeval;
+
+
+    bool authoritative = (data[2] & (1 << 2)) != 0;
+    bool truncation = (data[2] & (1 << 1)) != 0;
+    bool recursionDesired = (data[2] & (1 << 0)) != 0;
+
+    //byte 4
+    bool recursionAvailable = (data[3] & (1 << 7)) != 0;
+    int reservedVal = (data[3] >> 4) & (1 << 3);
+    Reserved reserved = (Reserved)reservedVal;
+    int responseCodeVal = data[3] & 0x0f;
+    ResponseCodes responseCode = (ResponseCodes)responseCodeVal;
+
+    short qdcount = JoinShort(data.Slice(4, 2));
+    short ancount = JoinShort(data.Slice(6, 2));
+    short nscount = JoinShort(data.Slice(8, 2));
+    short arcount = JoinShort(data.Slice(10, 2));
+
+
+    return new DNSHeader(id, qr, opcode, authoritative, truncation, recursionDesired, recursionAvailable, reserved, responseCode, qdcount, ancount, nscount, arcount);
+}
+
 
 static byte[] EncodeQuestion(DNSQuestion question)
 {
@@ -201,9 +241,12 @@ static byte[] EncodeAnswer(DNSAnswer answer)
     var lenBytes = new byte[2];
     (lenBytes[0], lenBytes[1]) = SplitShort((short)answer.Length);
 
-    byte[] res = [.. nameBytes, 0, .. typeBytes, ..classBytes,..ttlBytes, ..lenBytes, ..answer.Data];
+    byte[] res = [.. nameBytes, 0, .. typeBytes, .. classBytes, .. ttlBytes, .. lenBytes, .. answer.Data];
     return res;
 }
+
+
+
 
 
 static (byte, byte) SplitShort(short input)
@@ -215,6 +258,11 @@ static (byte, byte) SplitShort(short input)
     b2 = (byte)(input & 0xff);
 
     return (b1, b2);
+}
+static short JoinShort(Span<byte> bytes)
+{
+    short n = (short)((bytes[0] << 8) | bytes[1]);
+    return n;
 }
 
 static byte[] SplitInt(int input)
@@ -241,7 +289,7 @@ enum QRId
 
 enum Opcodes : int
 {
-    None = 0,
+    None = 0, 
 }
 
 enum Reserved
@@ -252,6 +300,7 @@ enum Reserved
 enum ResponseCodes
 {
     Ok = 0,
+    NotImplemented = 4,
 }
 
 record DNSHeader(
@@ -284,3 +333,4 @@ record DNSQuestion(List<string> Labels, RecordTypes RecordType, RecordClasses Cl
 record DNSAnswer(List<string> Labels, RecordTypes RecordType, RecordClasses Class, int TTL, short Length, byte[] Data);
 
 record DNSResponse(DNSHeader Header, DNSQuestion Question, DNSAnswer Answer);
+record DNSRequest(DNSHeader Header);
