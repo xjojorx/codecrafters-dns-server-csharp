@@ -3,6 +3,13 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 
+IPEndPoint? resolver = null;;
+//arguments
+if(args.Length > 1 && args[0] == "--resolver") {
+    resolver = IPEndPoint.Parse(args[1]);
+    Console.WriteLine("have a resolver: "+ args[1]);
+}
+
 // Resolve UDP address
 IPAddress ipAddress = IPAddress.Parse("127.0.0.1");
 int port = 2053;
@@ -16,7 +23,7 @@ while (true)
     // Receive data
     IPEndPoint sourceEndPoint = new IPEndPoint(IPAddress.Any, 0);
     byte[] receivedData = udpClient.Receive(ref sourceEndPoint);
-    var response = HandleMessage(receivedData, sourceEndPoint);
+    var response = HandleMessage(receivedData, sourceEndPoint, resolver);
 
     // Send response
     udpClient.Send(response, response.Length, sourceEndPoint);
@@ -26,7 +33,7 @@ while (true)
 /// logic
 ///////////////////////////////////////
 
-static byte[] HandleMessage(byte[] data, IPEndPoint sourceEndPoint)
+static byte[] HandleMessage(byte[] data, IPEndPoint sourceEndPoint, IPEndPoint? resolver)
 {
     string receivedString = Encoding.ASCII.GetString(data);
 
@@ -34,7 +41,13 @@ static byte[] HandleMessage(byte[] data, IPEndPoint sourceEndPoint)
 
     var req = ParseRequest(data);
 
-    var res = BuildResponse(req);
+    DNSResponse res;
+    if(resolver is not null) {
+        res = Resolve(req, resolver);
+    } else {
+        res = BuildResponse(req);
+    }
+
 
     var response = EncodeResponse(res);
 
@@ -59,8 +72,68 @@ static DNSRequest ParseRequest(ReadOnlySpan<byte> data) {
     }
 
 
-    var req = new DNSRequest(reqHeader, questions);
+    var req = new DNSRequest(reqHeader, questions, []);
     return req;
+}
+static DNSResponse ParseResponse(ReadOnlySpan<byte> data) {
+
+    var reqHeader = ParseHeader(data.Slice(0,12));
+
+    int idx = 12;
+    List<DNSQuestion> questions = [];
+    for (int i = 0; i < reqHeader.QuestionCount; i++)
+    {
+        var (question, read) = ParseQuestion(data.Slice(idx), data);
+        questions.Add(question);
+        idx += read;
+    }
+
+    List<DNSAnswer> answers = [];
+    for (int i = 0; i < reqHeader.AnswerRecordCount; i++)
+    {
+        var (answer, read) = ParseAnswer(data.Slice(idx), data);
+        answers.Add(answer);
+        idx += read;
+    }
+
+    var req = new DNSResponse(reqHeader, questions, answers);
+    return req;
+}
+
+static DNSResponse Resolve(DNSRequest request, IPEndPoint resolverIP) {
+    var answers = request.Questions.Select(q => ResolveQuestion(q, resolverIP, request)).Where(a => a is not null).Cast<DNSAnswer>().ToList();
+    ResponseCodes rc = request.Header.Opcode switch {
+        0 => ResponseCodes.Ok,
+        _ => ResponseCodes.NotImplemented
+    };
+    var header = new DNSHeader(request.Header.ID, QRId.Response, request.Header.Opcode, false, false, request.Header.RecursionDesired, false, Reserved.None, rc, request.Header.QuestionCount, (short)answers.Count, 0, 0);
+    var question = request.Questions;
+
+    return new DNSResponse(header, question, answers);
+}
+
+static DNSAnswer? ResolveQuestion(DNSQuestion question, IPEndPoint resolverIP, DNSRequest request)
+{
+    // build a request
+    var header = new DNSHeader(request.Header.ID, QRId.Query, request.Header.Opcode, false, false, request.Header.RecursionDesired, false, Reserved.None, ResponseCodes.Ok, 1, 1, 0, 0);
+    var req = new DNSRequest(header, [question], []);
+
+    // send to resolver
+    byte[] pkg = EncodeRequest(req);
+    var resolverUDP = new UdpClient(resolverIP.Address.ToString(), resolverIP.Port);
+    resolverUDP.Send(pkg, pkg.Length);
+    // Console.WriteLine("pkg sent: " + Convert.ToHexString(pkg));
+    // Console.WriteLine("pkg sent: " + Encoding.ASCII.GetString(pkg));
+
+    // wait for response
+    var resBytes = resolverUDP.Receive(ref resolverIP);
+    var res = ParseResponse(resBytes);
+    // Console.WriteLine($"res parsed, {res.Answers.Count}");
+
+    // get the answer (assume always-existing single answer)
+    var answer = res.Answers.FirstOrDefault();
+
+    return answer;
 }
 
 static DNSResponse BuildResponse(DNSRequest request)
@@ -115,6 +188,18 @@ static byte[] EncodeResponse(DNSResponse response)
     var header = EncodeHeader(response.Header);
     var question = EncodeQuestions(response.Questions);
     var answer = EncodeAnswers(response.Answers);
+
+    using var ms = new MemoryStream();
+    ms.Write(header);
+    ms.Write(question);
+    ms.Write(answer);
+    return ms.ToArray();
+}
+static byte[] EncodeRequest(DNSRequest request)
+{
+    var header = EncodeHeader(request.Header);
+    var question = EncodeQuestions(request.Questions);
+    var answer = EncodeAnswers(request.Answers);
 
     using var ms = new MemoryStream();
     ms.Write(header);
@@ -240,6 +325,59 @@ static byte[] EncodeLabel(string label)
 static (DNSQuestion q, int readBytes) ParseQuestion(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> fullBuffer) {
     //read labels (read until 0x00;
 
+    var (labels, idx) = ReadLabels(buffer, fullBuffer);
+    Console.WriteLine("got labels: " + string.Join(" : ", labels));
+    // Console.WriteLine("got idx: " + idx);
+    // Console.WriteLine("rest: " + Convert.ToHexString(buffer[idx..]));
+
+    var typeVal = BinaryPrimitives.ReadInt16BigEndian(buffer[idx..]);
+    var type = (RecordTypes) typeVal;
+    idx +=2;
+
+    var classVal = BinaryPrimitives.ReadInt16BigEndian(buffer[idx..]);
+    var rclass = (RecordClasses) classVal;
+    idx +=2;
+
+    return (new DNSQuestion(labels, type, rclass), idx);
+}
+static (List<string>, int) ReadLabels(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> fullBuffer) {
+    List<String> labels = [];
+    int idx = 0;
+    bool labelsEnd = false;
+    while(!labelsEnd) {
+        var len = buffer[idx];
+        int asptr = BinaryPrimitives.ReadUInt16BigEndian(buffer.Slice(idx));
+        // Console.WriteLine($"asshort:  {asptr:X}");
+        switch (len)
+        {
+            case 0x00:
+                idx++;
+                labelsEnd = true;
+                // Console.WriteLine("was a 0");
+                break;
+            case var p when (p & 0xc0) != 0:
+                int ptr = BinaryPrimitives.ReadUInt16BigEndian(buffer.Slice(idx)) & 0x3FFF;
+                idx += 2;
+
+                var refBuf = fullBuffer.Slice(ptr);
+                var (refLabels, _) = ReadLabels(refBuf, fullBuffer);
+                labels.AddRange(refLabels);
+                labelsEnd = true;
+                break;
+            default:
+                idx++;
+                var labelBytes = buffer.Slice(idx,len);
+                var label = Encoding.ASCII.GetString(labelBytes);
+                labels.Add(label);
+                idx += len;
+                break;
+        }
+    }
+    return (labels, idx);
+}
+static (DNSAnswer a, int readBytes) ParseAnswer(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> fullBuffer) {
+    //read labels (read until 0x00;
+
     List<String> labels = [];
     int idx = 0;
     bool labelsEnd = false;
@@ -253,7 +391,6 @@ static (DNSQuestion q, int readBytes) ParseQuestion(ReadOnlySpan<byte> buffer, R
                 break;
             case var p when (p & 0xc0) != 0:
                 int ptr = BinaryPrimitives.ReadUInt16BigEndian(buffer.Slice(idx)) & 0x3FFF;
-                // var ptr = BinaryPrimitives.ReadUInt16BigEndian(buffer) & 0x3FFF;
                 idx += 2;
                 var refLen = fullBuffer[ptr];
                 var refLBytes = fullBuffer.Slice(ptr+1, refLen);
@@ -279,7 +416,18 @@ static (DNSQuestion q, int readBytes) ParseQuestion(ReadOnlySpan<byte> buffer, R
     var rclass = (RecordClasses) classVal;
     idx +=2;
 
-    return (new DNSQuestion(labels, type, rclass), idx);
+    var ttl = BinaryPrimitives.ReadInt32BigEndian(buffer[idx..]);
+    idx += 4;
+
+    var datalen = BinaryPrimitives.ReadInt16BigEndian(buffer[idx..]);
+    idx +=2;
+
+    var data = buffer.Slice(idx, datalen).ToArray();
+    idx += datalen;
+
+    var ans = new DNSAnswer(labels, type, rclass, ttl, datalen, data);
+
+    return (ans, idx);
 }
 
 static byte[] EncodeAnswers(IList<DNSAnswer> questions) => questions.SelectMany(EncodeAnswer).ToArray();
@@ -393,4 +541,6 @@ record DNSQuestion(List<string> Labels, RecordTypes RecordType, RecordClasses Cl
 record DNSAnswer(List<string> Labels, RecordTypes RecordType, RecordClasses Class, int TTL, short Length, byte[] Data);
 
 record DNSResponse(DNSHeader Header, List<DNSQuestion> Questions, List<DNSAnswer> Answers);
-record DNSRequest(DNSHeader Header, List<DNSQuestion> Questions);
+record DNSRequest(DNSHeader Header, List<DNSQuestion> Questions, List<DNSAnswer> Answers);
+
+
